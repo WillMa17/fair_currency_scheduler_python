@@ -14,7 +14,7 @@ class ExperimentConfig:
     starting_currency: float = 0.0
 
 
-def experiment_base(cfg: ExperimentConfig) -> Tuple[Scheduler, List[Task]]:
+def experiment_base(cfg: ExperimentConfig) -> Tuple[Scheduler, List[Task], List[Task]]:
     sched = Scheduler()
     tasks: List[Task] = []
     for pid in range(cfg.num_tasks):
@@ -29,21 +29,50 @@ def experiment_base(cfg: ExperimentConfig) -> Tuple[Scheduler, List[Task]]:
         t.compute_vdeadline()
         tasks.append(t)
         sched.add(t)
-    return sched, tasks
+    return sched, tasks, []
 
 
-def experiment_slowdown(cfg: ExperimentConfig) -> Tuple[Scheduler, List[Task]]:
-    sched, tasks = experiment_base(cfg)
+def experiment_slowdown(cfg: ExperimentConfig) -> Tuple[Scheduler, List[Task], List[Task]]:
+    sched, tasks, [] = experiment_base(cfg)
     if len(tasks) > 1:
         tasks[0].state_changes = [(0.0, "slow"), (50.0, "normal")]
         tasks[1].state_changes = [(30.0, "slow"), (70.0, "normal")]
         tasks[2].state_changes = [(40.0, "slow"), (90.0, "normal")]
-    return sched, tasks
+    return sched, tasks, []
 
 
-def run_experiment(setup: Callable[[ExperimentConfig], Tuple[Scheduler, List[Task]]], cfg: ExperimentConfig) -> Dict:
-    sched, tasks = setup(cfg)
+def experiment_sleep(cfg: ExperimentConfig) -> Tuple[Scheduler, List[Task], List[Task]]:
+    sched, tasks, [] = experiment_base(cfg)
+    if len(tasks) > 1:
+        tasks[0].state_changes = [(10.0, "sleep"), (50.0, "wakeup")]
+        tasks[1].state_changes = [(20.0, "sleep"), (60.0, "wakeup")]
+    return sched, tasks, []
 
+
+def experiment_fork(cfg: ExperimentConfig) -> Tuple[Scheduler, List[Task], List[Task]]:
+    sched, tasks, [] = experiment_base(cfg)
+    incoming_tasks = []
+    for pid in range(3, 6):
+        t = Task(
+            sort_key=0.0,
+            pid=pid,
+            total_work=cfg.total_work
+        )
+        t.fork_time = pid * 20.0
+        t.update_weight_simple()
+        t.timeslice = cfg.timeslice
+        t.currency = cfg.starting_currency
+        t.compute_vdeadline()
+        incoming_tasks.append(t)
+    # incoming_tasks[0].state_changes = [(105.0, "sleep"), (140.0, "wakeup")]
+    tasks[0].state_changes = [(30.0, "slow"), (120.0, "normal")]
+    return sched, tasks, incoming_tasks
+
+
+def run_experiment(setup: Callable[[ExperimentConfig], Tuple[Scheduler, List[Task], List[Task]]], cfg: ExperimentConfig) -> Dict:
+    sched, starting_tasks, incoming_tasks = setup(cfg)
+    tasks = starting_tasks + incoming_tasks
+    
     time_axis: List[int] = []
     total_currency: List[float] = []
     vruntimes: List[List[float]] = [[] for _ in tasks]
@@ -58,6 +87,11 @@ def run_experiment(setup: Callable[[ExperimentConfig], Tuple[Scheduler, List[Tas
         currency_levels[i].append(t.currency)
 
     for tick in range(1, cfg.num_ticks + 1):
+        for t in incoming_tasks:
+            if t.fork_time <= tick:
+                sched.task_fork(t)
+                incoming_tasks.remove(t)
+
         sched.tick()
         time_axis.append(tick)
         total_currency.append(round(sum(t.currency for t in tasks), 9))
@@ -122,10 +156,11 @@ def plot_results(results: Dict, outfile: str = "model_output.png") -> None:
     plt.close(fig)
     print(f"Saved plot to {outfile}")
 
+
 def main():
     cfg = ExperimentConfig()
-    results = run_experiment(experiment_slowdown, cfg)
-    plot_results(results, outfile="model_output_slowdown.png")
+    results = run_experiment(experiment_fork, cfg)
+    plot_results(results, outfile="model_output_fork.png")
 
 
 if __name__ == "__main__":
