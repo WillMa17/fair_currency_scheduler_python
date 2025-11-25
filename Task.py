@@ -75,7 +75,10 @@ class Task:
         self.currency_rate = rate
         print(rate)
     
-    def increase_runtime(self, run):
+    def increase_runtime_sleep(self, run):
         self.remaining_time = max(0.0, self.remaining_time - run)
         self.vruntime += run / self.weight
+    
+    def increase_runtime(self, run):
+        self.increase_runtime_sleep(run)
         self.currency -= run

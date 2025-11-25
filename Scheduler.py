@@ -3,6 +3,7 @@ import heapq
 
 slowdown_factor = 0.5
 speedup_factor = 2.0
+sleep_slowdown_factor = 0.9
 
 def special_event(event_name):
     return event_name == "wakeup" or event_name == "fork"
@@ -27,13 +28,8 @@ class Scheduler:
         if eligible:
             return min(eligible)[1]
 
-        # Idea 1: if no eligible tasks, use earliest vdeadline (work conserving)
+        # Idea: if no eligible tasks, use earliest vdeadline (work conserving)
         return self.runqueue[0][1] if self.runqueue else None
-        # Idea 2: if no eligible task, wait until a task is eligible 
-        # (no this is actually dumb)
-        # for vd, t in self.runqueue:
-        #     print(t.currency)
-        # return None
     
     def redistribute_currency(self, currency, mode):
         print("redistributing")
@@ -82,25 +78,28 @@ class Scheduler:
         # denom = sum_i (entitlement_i * currency_rate_i)
         if len(self.runqueue) == 0: #currency shouldn't be accumulating if there are no tasks
             return
-        total_weight = sum(t.weight for _, t in self.runqueue) + sum(t.weight for t in self.waitqueue)
+        total_weight = sum(t.weight for _, t in self.runqueue) 
+        total_weight_including_sleep = total_weight + sum(t.weight for t in self.waitqueue)
         for _, t in self.runqueue:
             t.compute_lag(self.avg_vruntime)
         denom = 0.0
+        denom_including_sleep = 0.0
         if total_weight > 0:
             for _, t in self.runqueue:
                 denom += (t.weight / total_weight) * t.currency_rate
+                denom_including_sleep += (t.weight / total_weight_including_sleep) * t.currency_rate
             for t in self.waitqueue:
-                if t.currency < t.timeslice:
-                    denom += (t.weight / total_weight) * t.currency_rate
+                denom_including_sleep += (t.weight / total_weight_including_sleep) * t.currency_rate
         k = (1.0 / denom) if denom > 0.0 else 0.0
+        k_sleep = (1.0 / denom_including_sleep) if denom_including_sleep > 0.0 else 0.0
         for _, t in self.runqueue:
             if total_weight > 0:
                 entitlement = t.weight / total_weight
                 t.increase_currency(entitlement * k)
         for t in self.waitqueue:
-            if total_weight > 0 and t.currency < t.timeslice:
-                entitlement = t.weight / total_weight
-                t.increase_currency(entitlement * k)
+            if total_weight_including_sleep > 0:
+                entitlement = (t.weight / total_weight_including_sleep) * sleep_slowdown_factor * t.currency_rate
+                t.increase_runtime_sleep(entitlement * k_sleep) #how much you would theoretically run if you weren't sleeping
 
     def elapse_time(self):
         self.system_time += 1.0
@@ -124,11 +123,11 @@ class Scheduler:
             self.remove_from_runqueue(t)
             self.curr_task = None
             self.curr_task_time_left = 0.0
-            t.reset_currency_rate()
+            t.set_currency_rate(self.slowdown_factor)
             self.waitqueue.append(t)
         elif event[1] == "wakeup":
             self.remove_from_waitqueue(t)
-            t.vruntime = max(t.vruntime, self.avg_vruntime)
+            t.set_currency_rate(self.speedup_factor)
             self.add(t)
             self.avg_vruntime = self.compute_average_vruntime()
         elif event[1] == "slow":

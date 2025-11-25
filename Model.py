@@ -45,7 +45,7 @@ def experiment_sleep(cfg: ExperimentConfig) -> Tuple[Scheduler, List[Task], List
     sched, tasks, [] = experiment_base(cfg)
     if len(tasks) > 1:
         tasks[0].state_changes = [(10.0, "sleep"), (50.0, "wakeup")]
-        tasks[1].state_changes = [(20.0, "sleep"), (60.0, "wakeup")]
+        tasks[1].state_changes = [(20.0, "slow"), (60.0, "normal")]
     return sched, tasks, []
 
 
@@ -64,7 +64,7 @@ def experiment_fork(cfg: ExperimentConfig) -> Tuple[Scheduler, List[Task], List[
         t.currency = cfg.starting_currency
         t.compute_vdeadline()
         incoming_tasks.append(t)
-    # incoming_tasks[0].state_changes = [(105.0, "sleep"), (140.0, "wakeup")]
+    incoming_tasks[0].state_changes = [(105.0, "sleep"), (140.0, "wakeup")]
     tasks[0].state_changes = [(30.0, "slow"), (120.0, "normal")]
     return sched, tasks, incoming_tasks
 
