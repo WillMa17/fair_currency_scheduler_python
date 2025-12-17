@@ -1,0 +1,103 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{amsmath}
+
+\title{Currency-Mediated Fair Scheduling on Top of EEVDF}
+\author{Sebastian Angel, Linh Thi Xuan Phan, Suwei Ma}
+\date{November 2025}
+
+\begin{document}
+
+\maketitle
+
+\subsection*{Objective}
+We want a scheduler that is fair by weight, work-conserving, timeslice-aware, and able to express short bursts of urgency without asking for real-time privilege. It must handle dynamic processes (fork/join, sleep/wake), remain incentive-compatible so unmodified tasks are no worse off, and be efficient enough to drop into today’s kernel. Currency layered on EEVDF is our proposal to meet these goals while keeping the writing and intuition of CFS/EEVDF.
+
+\subsection*{Design Rationale}
+EEVDF (as used by CFS) orders tasks by virtual deadlines derived from \texttt{vruntime} and a task's timeslice. The eligible task with the earliest virtual deadline runs. This gives proportional fairness and work conservation, but it does not expose a bounded way for tasks to express short-term urgency without moving to a privileged real-time class. We want to keep the core EEVDF machinery and add a layer that lets tasks defer work now and catch up later, without disturbing unmodified tasks.
+
+Our currency adds a conserved account: tasks accrue credit across time and spend it when they run. By replacing lag with currency as the eligibility check, processes can voluntarily slow their currency accrual rate (banking credit) and later get a temporary boost to their accrual rate. The boost lasts only until the task reaches the current maximum runnable \texttt{vruntime} (not just the average), so a slowed or sleeping task can fully catch up to the front of the pack but cannot overshoot peers that never slowed. This preserves backward compatibility: tasks that never opt in see the same behavior as stock EEVDF, and tasks that do opt in cannot take more than their fair share over the long run. The design remains incentive-compatible because deferral is voluntary, and boosts are bounded by the task’s own lag and end when it is no longer behind.
+
+\subsection*{Mechanism}
+
+\paragraph{State.}
+Each task \texttt{$t_i$} tracks vruntime $v_i$, physical runtime (pruntime), weight $w_i$, currency balance $c_i$, and a currency accrual rate $r_i$. The baseline rate is 1.0. A task may enter state changes that switch its accrual rate between \emph{normal} (return to baseline) and \emph{slow} (a predetermined slowdown). The scheduler tracks both the average and the maximum runnable \texttt{vruntime} to decide how long boosts should last.
+
+\paragraph{Eligibility and selection.}
+We gate by currency: when selecting, we consider runnable tasks with
+non-negative currency and pick the one with the earliest virtual deadline
+(EEVDF). If no such task exists, a system may either idle or fall back to the
+earliest deadline to be work-conserving (our prototype ensures work conservation by defaulting to regular EEVDF, though this situation should rarely occur). Tasks that never slow accrue at baseline and follow the same eligibility cadence they would under stock EEVDF.
+
+\paragraph{Accrual and spend.}
+On each tick, the currently running task spends 1 unit of currency per unit of
+runtime. In parallel, every task on the runqueue accrues currency at a rate
+proportional to its weight share and scaled by its \texttt{currency\_rate}:
+we compute
+\[ k = \Big(\sum_{i\in R} \underbrace{\tfrac{w_i r_i}{\sum_j w_j}}_{\text{entitlement}})^{-1} \]
+and credit each runnable task \(i\) an amount \( (w_i/\sum_j w_j)\cdot k \cdot r_i\). This
+normalization makes the total credited currency per busy tick equal to 1, so the
+system-wide currency remains approximately conserved when the CPU is busy. 
+
+We note that this normalization effect means that if a task in the runqueue were to slow down its currency accrual rate, all other tasks previously operating at the baseline rate will begin to accrue currency at a rate slightly above the baseline. This is to ensure two properties
+
+\begin{itemize}
+    \item The total credited currency per busy tick, \[ \sum_{i \in R} \Delta c_i = 1\]
+    thus maintaining work conservation
+    \item \[ \sum_{i \in R} c_i = \sum_{i \in R} \text{Lag}_i = 0\]
+    thus allowing us to maintain EEVDF guarantees.
+\end{itemize}
+
+\paragraph{Slowdown/normal transitions.}
+The scheduler exposes two parameters: a slowdown factor (e.g., 0.5) and a
+speedup factor (e.g., 2.0). \texttt{slow} multiplies the current
+\texttt{currency\_rate} by the slowdown factor. \texttt{normal} restores toward
+baseline. However, if a task attempts to restore towards baseline, and it is noted that it has a high positive lag (typically the result of having slowed down its execution previously), it will instead have its currency accrual rate boosted to the speedup factor temporarily instead, up until it catches up with the rest of the processes. We determine this by computing average \texttt{vruntime} over the runqueue $\overline{v}$, the maximum runnable \texttt{vruntime} $v_{\max}$, and a per-task lag \(\text{Lag}_i = w_i (\overline{v} - v_i)\); we clamp boosted acquisition back to baseline when a task is ahead (\(\text{Lag}_i < 0\)) or when it reaches \(v_{\max}\).
+
+\paragraph{Sleep and wake}
+In order to support \texttt{sleep}/\texttt{wakeup} events, certain adjustments are needed. In vanilla EEVDF, tasks do not accrue currency nor lag when they are on the waitqueue, as the notion of "ideal service time" intuitively only exists for tasks on the runqueue. However, such a system is unemployable in our design, as should blocking tasks receive no compensation for going to sleep, they would instead be incentivized to remain on the runqueue and enter slowdown mode, benefiting themselves but ultimately leading to wasted CPU cycles accomplishing no work on blocked inputs. 
+
+Instead, we passively increment the vruntime of tasks which choose to go to sleep by \emph{the relative rate their vruntime would be increasing by should they have remained on the runqueue in slowdown mode}, times another additional discount factor $\delta = 0.9$ to account for the fact that they are not on the runqueue and thus do not get the benefit of running at all. We posit that this achieves two effects:
+
+\begin{itemize}
+    \item Tasks which are blocked on some input and would typically go to sleep will choose to sleep rather than slowdown, as they get zero utility from any CPU share at the moment and would instead prefer the marginally slower vruntime accrual rate. 
+    \item Tasks which believe themselves to currently be in a low-priority state would prefer to slowdown rather than sleep, as they can still get more utility out of the CPU share from remaining on the runqueue compared to the marginal increase in lag buildup from sleeping.
+\end{itemize}
+
+Once a task returns from sleep, it is able to receive a boost in its currency accrual rate, similar to if it had slowed down previously. 
+
+\paragraph{Dynamic runqueues}
+In a typical system, tasks will often join and leave the runqueue. To maintain the fairness and properties of this system, we employ currency redistribution as follows:
+\begin{itemize}
+    \item If a task $t_i$ leaves the runqueue, its currency $c_i$ (whether positive or negative) is redistributed among the remaining tasks proportional to their weights.
+    \item If a task $t_i$ joins the runqueue, it immediately accrues a negative "tax" $-\epsilon$. Consequently, the other tasks on the runqueue share this tax of $\epsilon$ among themselves, positively proportional to \emph{how long each task has previously slowed down for}.
+\end{itemize}
+
+The reasoning for the latter design choice is as follows:
+\begin{itemize}
+    \item One concern in our implementation is that if a task $t_{slow}$ were to enter slowdown mode, its neighboring tasks could all finish execution and leave the runqueue, leaving the slow task as the only task left in the runqueue. The average vruntime of the system would then uniquely be based on $t_{slow}$, and as such, its lag would be correspondingly 0. Once new tasks join, if $t_{slow}$ were to then regain priority, it would be unable to receive a boost as it is not theoretically lagging behind the other tasks. Thus, the task would have slowed down for nothing, reducing its overall CPU share and contradicting incentive compatibility.
+    \item To combat this, we ensure that every new task receives an initial penalty which is redistributed among the older tasks, favoring those which have deferred their execution the longest. 
+    \item As every task is subject to this penalty, this does not create additional fairness concerns, since every task can benefit from the taxes reaped on every subsequent task, and the long-term fairness arguments of EEVDF continues to hold.
+\end{itemize}
+
+\subsection*{Experiment}
+We simulate fork/join, sleep/wake, and slowdown/normal patterns to visualize vruntime, pruntime, lag, currency rates, and currency levels for both currency-layered EEVDF and vanilla EEVDF. The side-by-side plots show deferred tasks banking credit, then receiving a bounded boost on wake/exit-from-slow until they meet the current leader. Total currency remains conserved, and unmodified tasks track the same vruntime trajectory as in the baseline.
+
+\subsection*{Properties and Discussion}
+\paragraph{Fairness and conservation.}
+While the CPU is busy, the normalization ensures one unit of currency is
+credited across the runqueue per tick, and the running task spends one unit.
+Thus the system's total currency is approximately conserved (up to numerical
+rounding). EEVDF's ordering is preserved: we still pick by earliest virtual
+deadline among eligible tasks.
+
+\paragraph{Incentive Compatibility.}
+Importantly, as the currency mechanism is tightly related to EEVDF's lag mechanism, incentive compatibility holds, as a process which chooses not to partake in slowdown and speedup transitions will observe the same guarantees as it would under EEVDF. Furthermore, as processes are only able to willingly enter slowdown (since speedup is only contingent on lag, not process indication), we eliminate the possibility of any game-ification of the system to receive a higher CPU share than is considered fair under typical fair scheduling. 
+
+\paragraph{Timeslice awareness and work conservation.}
+Virtual deadlines and \texttt{vruntime} still encode the effect of different timeslices; currency gating does not disturb the timeslice math. When eligible tasks exist we run the earliest deadline; if none exist we fall back to earliest deadline to keep the CPU busy.
+
+\paragraph{Kernel efficiency.}
+We reuse the existing CFS/EEVDF bookkeeping (weights, \texttt{vruntime}, deadlines) and add a small per-task currency balance and rate plus lightweight redistribution on join/exit. No privileged interfaces are required, and if no task opts into slowdown the system behaves exactly like today.
+
+\end{document}

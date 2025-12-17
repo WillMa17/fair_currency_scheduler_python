@@ -14,6 +14,7 @@ class Scheduler:
         self.waitqueue = []
         self.system_time = 0.0
         self.avg_vruntime = 0.0
+        self.max_vruntime = 0.0
         self.curr_task = None
         self.curr_task_time_left = 0.0
         self.eventqueue = []
@@ -24,6 +25,7 @@ class Scheduler:
     
     def add(self, task):
         heapq.heappush(self.runqueue, (task.vdeadline, task))
+        self.update_max_vruntime()
     
     def _reheap_with_current_deadlines(self):
         # Rebuild runqueue tuples so updated vdeadlines are respected.
@@ -76,10 +78,12 @@ class Scheduler:
             if t == task:
                 self.runqueue.remove((vd, t))
         heapq.heapify(self.runqueue)
+        self.update_max_vruntime()
     
     def remove_from_waitqueue(self, task):
         if task in self.waitqueue:
             self.waitqueue.remove(task)
+        self.update_max_vruntime()
     
     def compute_average_vruntime(self):
         numerator = 0.0
@@ -96,6 +100,16 @@ class Scheduler:
         if min_runqueue_vr is not None:
             return min_runqueue_vr
         return self.avg_vruntime
+    
+    def update_max_vruntime(self):
+        max_runqueue_vr = max((t.vruntime for _, t in self.runqueue), default=None)
+        max_waitqueue_vr = max((t.vruntime for t in self.waitqueue), default=None)
+        if max_runqueue_vr is None and max_waitqueue_vr is None:
+            self.max_vruntime = self.avg_vruntime
+            return self.max_vruntime
+        candidates = [vr for vr in (max_runqueue_vr, max_waitqueue_vr) if vr is not None]
+        self.max_vruntime = max(candidates)
+        return self.max_vruntime
      
     def accrue_currency(self):
         if not self.use_currency:
@@ -106,8 +120,6 @@ class Scheduler:
             return
         total_weight = sum(t.weight for _, t in self.runqueue) 
         total_weight_including_sleep = total_weight + sum(t.weight for t in self.waitqueue)
-        for _, t in self.runqueue:
-            t.compute_lag(self.avg_vruntime)
         denom = 0.0
         denom_including_sleep = 0.0
         if total_weight > 0:
@@ -125,18 +137,21 @@ class Scheduler:
         for t in self.waitqueue:
             if total_weight_including_sleep > 0:
                 entitlement = (t.weight / total_weight_including_sleep) * sleep_slowdown_factor * t.currency_rate
-                t.increase_runtime_sleep(entitlement * k_sleep) #how much you would theoretically run if you weren't sleeping
+                t.increase_vruntime(entitlement * k_sleep) #how much you would theoretically run if you weren't sleeping
+        self.refresh_lags()
 
     def elapse_time(self):
         self.system_time += 1.0
         self.curr_task_time_left = max(0.0, self.curr_task_time_left - 1.0)
         if self.curr_task:
             if self.use_currency:
-                self.curr_task.increase_runtime(1.0)
+                self.curr_task.increase_runtime_currency(1.0)
             else:
-                self.curr_task.increase_runtime_sleep(1.0)
+                self.curr_task.increase_runtime_base(1.0)
 
         self.avg_vruntime = self.compute_average_vruntime()
+        self.update_max_vruntime()
+        self.refresh_lags()
         self.accrue_currency()
         if self.curr_task:
             if self.curr_task.remaining_time == 0.0:
@@ -145,6 +160,13 @@ class Scheduler:
                 self.curr_task.compute_vdeadline()
 
         self._reheap_with_current_deadlines()
+
+    def refresh_lags(self):
+        vr_ref = self.avg_vruntime
+        for _, t in self.runqueue:
+            t.compute_lag(vr_ref, self.max_vruntime)
+        for t in self.waitqueue:
+            t.compute_lag(vr_ref, self.max_vruntime)
     
     def handle_event(self, event):
         t = event[0]
@@ -153,12 +175,12 @@ class Scheduler:
             self.curr_task = None
             self.curr_task_time_left = 0.0
             if self.use_currency:
-                t.set_currency_rate(self.slowdown_factor)
+                t.set_currency_rate(self.slowdown_factor, self.system_time)
             self.waitqueue.append(t)
         elif event[1] == "wakeup":
             self.remove_from_waitqueue(t)
             if self.use_currency:
-                t.set_currency_rate(self.speedup_factor)
+                t.set_currency_rate(self.speedup_factor, self.system_time)
                 t.compute_vdeadline()
             else:
                 self.place_on_wakeup(t)
@@ -166,10 +188,10 @@ class Scheduler:
             self.avg_vruntime = self.compute_average_vruntime()
         elif event[1] == "slow":
             if self.use_currency:
-                t.set_currency_rate(self.slowdown_factor)
+                t.set_currency_rate(self.slowdown_factor, self.system_time)
         elif event[1] == "normal":
             if self.use_currency:
-                t.set_currency_rate(self.speedup_factor)
+                t.set_currency_rate(self.speedup_factor, self.system_time)
         elif event[1] == "exit":
             self.task_exit(t)
             self.curr_task = None
@@ -190,15 +212,16 @@ class Scheduler:
                 
     def process_events(self):
         for _, t in self.runqueue:
-            event = t.process_events(self.system_time)
-            if event:
+            events = t.process_events(self.system_time)
+            for event in events:
                 self.eventqueue.append((t, event))
         for t in self.waitqueue:
-            event = t.process_events(self.system_time)
-            if event:
+            events = t.process_events(self.system_time)
+            for event in events:
                 self.eventqueue.append((t, event))
         self.handle_events()
         self._reheap_with_current_deadlines()
+        self.update_max_vruntime()
 
     def tick(self):
         self.process_events()

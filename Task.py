@@ -13,6 +13,7 @@ class Task:
     weight: float = field(default=1.0, compare=False)
     currency: float = field(default=0.0, compare=False)
     timeslice: float = field(default=0.0, compare=False)
+    pruntime: float = field(default=0.0, compare=False)
     vruntime: float = field(default=0.0, compare=False)
     vdeadline: float = field(default=0.0, compare=False)
     currency_rate: float = field(default=1.0, compare=False)
@@ -33,12 +34,15 @@ class Task:
     
     def process_events(self, time):
         if len(self.state_changes) == 0:
-            return None
-        next_event = self.state_changes[0]
-        if next_event[0] == time:
-            return self.state_changes.pop(0)[1]
-        else:
-            return None
+            return []
+        events = []
+        while len(self.state_changes) > 0:
+            next_event = self.state_changes[0]
+            if next_event[0] <= time:
+                events.append(self.state_changes.pop(0)[1])
+            else:
+                break
+        return events
 
     def reset_task(self):
         self.remaining_time = self.total_work
@@ -57,9 +61,10 @@ class Task:
     def reset_currency_rate(self):
         self.currency_rate = self.baseline_currency_rate
 
-    def compute_lag(self, avg_vruntime):
+    def compute_lag(self, avg_vruntime, max_vruntime):
         self.lag = self.weight * (avg_vruntime - self.vruntime)
-        if self.lag < 0 and self.currency_rate > self.baseline_currency_rate:
+        if self.vruntime >= max_vruntime and self.currency_rate > self.baseline_currency_rate:
+        # if self.lag <= 0 and self.currency_rate > self.baseline_currency_rate:
             self.reset_currency_rate()
     
     def increase_currency(self, run):
@@ -69,16 +74,24 @@ class Task:
         if self.currency_rate < self.baseline_currency_rate:
             self.slowdown_score += 0.1
     
-    def set_currency_rate(self, rate):
+    def set_currency_rate(self, rate, system_time):
         if rate > 1 and self.currency_rate >= self.baseline_currency_rate:
             return
         self.currency_rate = rate
-        print(rate)
+        print(f"{self.pid}: {self.currency_rate}, at time {system_time}")
     
-    def increase_runtime_sleep(self, run):
+    def increase_pruntime(self, run):
+        self.pruntime += run 
+
+    def increase_vruntime(self, run):
         self.remaining_time = max(0.0, self.remaining_time - run)
         self.vruntime += run / self.weight
     
-    def increase_runtime(self, run):
-        self.increase_runtime_sleep(run)
+    def increase_runtime_currency(self, run):
+        self.increase_vruntime(run)
+        self.increase_pruntime(run)
         self.currency -= run
+    
+    def increase_runtime_base(self, run):
+        self.increase_vruntime(run)
+        self.increase_pruntime(run)

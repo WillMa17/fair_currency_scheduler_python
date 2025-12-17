@@ -83,8 +83,11 @@ def experiment_fork(cfg: ExperimentConfig, scheduler_factory: Callable[[], Sched
     incoming_tasks[0].state_changes = [(105.0, "sleep"), (140.0, "wakeup")]
     tasks[0].state_changes = [(30.0, "slow"), (120.0, "normal")] + [(200.0, "slow"), (201.0, "normal"), (240.0, "slow"), (241.0, "normal")]
     tasks[1].state_changes = [(15.0, "sleep"), (30.0, "wakeup"), (45.0, "sleep"), (70.0, "wakeup"),
-                              (75.0, "slow"), (100.0, "normal"), (125.0, "sleep"), (160.0, "wakeup")] + [(200.0, "slow"), (201.0, "normal"), (240.0, "slow"), (241.0, "normal")]
+                              (75.0, "slow"), (100.0, "normal"), (125.0, "sleep"), (160.0, "wakeup")]  
+    for i in range(200, 300, 10):
+        tasks[1].state_changes += [(i, "slow"), (i, "normal")]
     
+    print(tasks[1].state_changes)
     for task in incoming_tasks:
         task.state_changes += [(200.0, "slow"), (201.0, "normal"), (240.0, "slow"), (241.0, "normal")]
     return sched, tasks, incoming_tasks
@@ -196,16 +199,20 @@ def run_experiment(setup: Callable[[ExperimentConfig, Callable[[], Scheduler]], 
     time_axis: List[int] = []
     total_currency: List[float] = []
     vruntimes: List[List[float]] = [[] for _ in tasks]
+    pruntimes: List[List[float]] = [[] for _ in tasks]
     currency_rates: List[List[float]] = [[] for _ in tasks]
     currency_levels: List[List[float]] = [[] for _ in tasks]
+    lags: List[List[float]] = [[] for _ in tasks]
     completion_times: List[Optional[int]] = [None for _ in tasks]
 
     time_axis.append(0)
     total_currency.append(sum(t.currency for t in tasks))
     for i, t in enumerate(tasks):
         vruntimes[i].append(t.vruntime)
+        pruntimes[i].append(t.pruntime)
         currency_rates[i].append(t.currency_rate)
         currency_levels[i].append(t.currency)
+        lags[i].append(t.lag)
 
     for tick in range(1, cfg.num_ticks + 1):
         for t in list(incoming_tasks):
@@ -218,8 +225,10 @@ def run_experiment(setup: Callable[[ExperimentConfig, Callable[[], Scheduler]], 
         total_currency.append(round(sum(t.currency for t in tasks), 9))
         for i, t in enumerate(tasks):
             vruntimes[i].append(t.vruntime)
+            pruntimes[i].append(t.pruntime)
             currency_rates[i].append(t.currency_rate)
             currency_levels[i].append(t.currency)
+            lags[i].append(t.lag)
             if completion_times[i] is None and t.remaining_time <= 0.0:
                 completion_times[i] = tick
 
@@ -227,8 +236,10 @@ def run_experiment(setup: Callable[[ExperimentConfig, Callable[[], Scheduler]], 
         "time": time_axis,
         "total_currency": total_currency,
         "vruntimes": vruntimes,
+        "pruntimes": pruntimes,
         "currency_rates": currency_rates,
         "currency_levels": currency_levels,
+        "lags": lags,
         "tasks": tasks,
         "scheduler": sched,
         "config": cfg,
@@ -236,7 +247,7 @@ def run_experiment(setup: Callable[[ExperimentConfig, Callable[[], Scheduler]], 
     }
 
 
-def run_comparison(setup: Callable[[ExperimentConfig, Callable[[], Scheduler]], Tuple[Scheduler, List[Task], List[Task]]], cfg: ExperimentConfig, wakeup_grace: float = 0.0) -> Tuple[Dict, Dict]:
+def run_comparison(setup: Callable[[ExperimentConfig, Callable[[], Scheduler]], Tuple[Scheduler, List[Task], List[Task]]], cfg: ExperimentConfig, wakeup_grace: float = 4.0) -> Tuple[Dict, Dict]:
     cur_sched = lambda: Scheduler(use_currency=True, wakeup_grace=wakeup_grace)
     eevdf_sched = lambda: EEVDFScheduler(wakeup_grace=wakeup_grace)
     results_currency = run_experiment(setup, cfg, scheduler_factory=cur_sched)
@@ -244,96 +255,122 @@ def run_comparison(setup: Callable[[ExperimentConfig, Callable[[], Scheduler]], 
     return results_currency, results_eevdf
 
 
-def plot_results(results: Dict, outfile: str = "model_output.png") -> None:
-    def _plot_panel(axis_list, res: Dict, title: Optional[str] = None):
-        time_axis = res["time"]
-        vruntimes = res["vruntimes"]
-        currency_rates = res["currency_rates"]
-        currency_levels = res["currency_levels"]
-        total_currency = res["total_currency"]
-
-        if title:
-            axis_list[0].set_title(title)
-
-        axis_list[0].plot(time_axis, total_currency, label="total_currency")
-        axis_list[0].set_ylabel("Total Currency")
-        axis_list[0].legend()
-        axis_list[0].grid(True, alpha=0.3)
-
-        for i in range(len(vruntimes)):
-            axis_list[1].plot(time_axis, vruntimes[i], label=f"task_{i} vruntime")
-        axis_list[1].set_ylabel("vruntime")
-        axis_list[1].legend()
-        axis_list[1].grid(True, alpha=0.3)
-
-        for i in range(len(currency_rates)):
-            axis_list[2].plot(time_axis, currency_rates[i], label=f"task_{i} rate")
-        axis_list[2].set_ylabel("currency_rate")
-        axis_list[2].legend()
-        axis_list[2].grid(True, alpha=0.3)
-
-        for i in range(len(currency_levels)):
-            axis_list[3].plot(time_axis, currency_levels[i], label=f"task_{i} currency")
-        axis_list[3].set_ylabel("currency")
-        axis_list[3].set_xlabel("tick")
-        axis_list[3].legend()
-        axis_list[3].grid(True, alpha=0.3)
-
+def plot_side_by_side(results_left: Dict, results_right: Dict, labels: Tuple[str, str] = ("Currency", "EEVDF"), outfile: Optional[str] = None, outfile_runtime: Optional[str] = None, outfile_currency: Optional[str] = None) -> None:
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
-    _plot_panel(axes, results)
+    time_left = results_left["time"]
+    time_right = results_right["time"]
+
+    vruntimes_left = results_left["vruntimes"]
+    pruntimes_left = results_left["pruntimes"]
+    lags_left = results_left["lags"]
+
+    vruntimes_right = results_right["vruntimes"]
+    pruntimes_right = results_right["pruntimes"]
+    lags_right = results_right["lags"]
+
+    total_currency_left = results_left["total_currency"]
+    total_currency_right = results_right["total_currency"]
+    currency_rates_left = results_left["currency_rates"]
+    currency_rates_right = results_right["currency_rates"]
+    currency_levels_left = results_left["currency_levels"]
+    currency_levels_right = results_right["currency_levels"]
+
+    base = outfile[:-4] if (outfile and outfile.endswith(".png")) else outfile
+    runtime_out = outfile_runtime or (f"{base}_runtime.png" if base else "model_output_comparison_runtime.png")
+    currency_out = outfile_currency or (f"{base}_currency.png" if base else "model_output_comparison_currency.png")
+
+    fig_rt, axes_rt = plt.subplots(3, 2, figsize=(14, 10), sharex="col")
+
+    for i in range(len(vruntimes_left)):
+        axes_rt[0, 0].plot(time_left, vruntimes_left[i], label=f"task_{i} vruntime")
+    axes_rt[0, 0].set_ylabel("vruntime")
+    axes_rt[0, 0].set_title(labels[0])
+    axes_rt[0, 0].legend()
+    axes_rt[0, 0].grid(True, alpha=0.3)
+
+    for i in range(len(vruntimes_right)):
+        axes_rt[0, 1].plot(time_right, vruntimes_right[i], label=f"task_{i} vruntime")
+    axes_rt[0, 1].set_ylabel("vruntime")
+    axes_rt[0, 1].set_title(labels[1])
+    axes_rt[0, 1].legend()
+    axes_rt[0, 1].grid(True, alpha=0.3)
+
+    for i in range(len(pruntimes_left)):
+        axes_rt[1, 0].plot(time_left, pruntimes_left[i], label=f"task_{i} pruntime")
+    axes_rt[1, 0].set_ylabel("pruntime")
+    axes_rt[1, 0].legend()
+    axes_rt[1, 0].grid(True, alpha=0.3)
+
+    for i in range(len(pruntimes_right)):
+        axes_rt[1, 1].plot(time_right, pruntimes_right[i], label=f"task_{i} pruntime")
+    axes_rt[1, 1].set_ylabel("pruntime")
+    axes_rt[1, 1].legend()
+    axes_rt[1, 1].grid(True, alpha=0.3)
+
+    for i in range(len(lags_left)):
+        axes_rt[2, 0].plot(time_left, lags_left[i], label=f"task_{i} lag")
+    axes_rt[2, 0].set_ylabel("lag")
+    axes_rt[2, 0].set_xlabel("tick")
+    axes_rt[2, 0].legend()
+    axes_rt[2, 0].grid(True, alpha=0.3)
+
+    for i in range(len(lags_right)):
+        axes_rt[2, 1].plot(time_right, lags_right[i], label=f"task_{i} lag")
+    axes_rt[2, 1].set_ylabel("lag")
+    axes_rt[2, 1].set_xlabel("tick")
+    axes_rt[2, 1].legend()
+    axes_rt[2, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(outfile, dpi=120)
-    plt.close(fig)
-    print(f"Saved plot to {outfile}")
+    plt.savefig(runtime_out, dpi=120)
+    plt.close(fig_rt)
+    print(f"Saved runtime comparison plot to {runtime_out}")
 
+    fig_cur, axes_cur = plt.subplots(3, 2, figsize=(14, 10), sharex="col")
 
-def plot_side_by_side(results_left: Dict, results_right: Dict, labels: Tuple[str, str] = ("Currency", "EEVDF"), outfile: str = "model_output_comparison.png") -> None:
-    import matplotlib.pyplot as plt
+    axes_cur[0, 0].plot(time_left, total_currency_left, label="total_currency")
+    axes_cur[0, 0].set_ylabel("Total Currency")
+    axes_cur[0, 0].set_title(labels[0])
+    axes_cur[0, 0].legend()
+    axes_cur[0, 0].grid(True, alpha=0.3)
 
-    fig, axes = plt.subplots(4, 2, figsize=(14, 12), sharex="row")
+    axes_cur[0, 1].plot(time_right, total_currency_right, label="total_currency")
+    axes_cur[0, 1].set_ylabel("Total Currency")
+    axes_cur[0, 1].set_title(labels[1])
+    axes_cur[0, 1].legend()
+    axes_cur[0, 1].grid(True, alpha=0.3)
 
-    def _panel(axis_list, res: Dict, title: str):
-        time_axis = res["time"]
-        vruntimes = res["vruntimes"]
-        currency_rates = res["currency_rates"]
-        currency_levels = res["currency_levels"]
-        total_currency = res["total_currency"]
+    for i in range(len(currency_rates_left)):
+        axes_cur[1, 0].plot(time_left, currency_rates_left[i], label=f"task_{i} rate")
+    axes_cur[1, 0].set_ylabel("currency_rate")
+    axes_cur[1, 0].legend()
+    axes_cur[1, 0].grid(True, alpha=0.3)
 
-        axis_list[0].plot(time_axis, total_currency, label="total_currency")
-        axis_list[0].set_ylabel("Total Currency")
-        axis_list[0].legend()
-        axis_list[0].grid(True, alpha=0.3)
-        axis_list[0].set_title(title)
+    for i in range(len(currency_rates_right)):
+        axes_cur[1, 1].plot(time_right, currency_rates_right[i], label=f"task_{i} rate")
+    axes_cur[1, 1].set_ylabel("currency_rate")
+    axes_cur[1, 1].legend()
+    axes_cur[1, 1].grid(True, alpha=0.3)
 
-        for i in range(len(vruntimes)):
-            axis_list[1].plot(time_axis, vruntimes[i], label=f"task_{i} vruntime")
-        axis_list[1].set_ylabel("vruntime")
-        axis_list[1].legend()
-        axis_list[1].grid(True, alpha=0.3)
+    for i in range(len(currency_levels_left)):
+        axes_cur[2, 0].plot(time_left, currency_levels_left[i], label=f"task_{i} currency")
+    axes_cur[2, 0].set_ylabel("currency")
+    axes_cur[2, 0].set_xlabel("tick")
+    axes_cur[2, 0].legend()
+    axes_cur[2, 0].grid(True, alpha=0.3)
 
-        for i in range(len(currency_rates)):
-            axis_list[2].plot(time_axis, currency_rates[i], label=f"task_{i} rate")
-        axis_list[2].set_ylabel("currency_rate")
-        axis_list[2].legend()
-        axis_list[2].grid(True, alpha=0.3)
-
-        for i in range(len(currency_levels)):
-            axis_list[3].plot(time_axis, currency_levels[i], label=f"task_{i} currency")
-        axis_list[3].set_ylabel("currency")
-        axis_list[3].set_xlabel("tick")
-        axis_list[3].legend()
-        axis_list[3].grid(True, alpha=0.3)
-
-    _panel(axes[:, 0], results_left, labels[0])
-    _panel(axes[:, 1], results_right, labels[1])
+    for i in range(len(currency_levels_right)):
+        axes_cur[2, 1].plot(time_right, currency_levels_right[i], label=f"task_{i} currency")
+    axes_cur[2, 1].set_ylabel("currency")
+    axes_cur[2, 1].set_xlabel("tick")
+    axes_cur[2, 1].legend()
+    axes_cur[2, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(outfile, dpi=120)
-    plt.close(fig)
-    print(f"Saved side-by-side plot to {outfile}")
+    plt.savefig(currency_out, dpi=120)
+    plt.close(fig_cur)
+    print(f"Saved currency comparison plot to {currency_out}")
 
 
 def summarize_results(results: Dict, label: str, scheduler_name: str) -> List[Dict]:
@@ -388,27 +425,24 @@ def run_suite(setup: Callable[[ExperimentConfig, Callable[[], Scheduler]], Tuple
 def main():
     cfg = ExperimentConfig()
     results_currency, results_eevdf = run_comparison(experiment_fork, cfg)
-    plot_results(results_currency, outfile="model_output_fork_currency.png")
-    plot_results(results_eevdf, outfile="model_output_fork_eevdf.png")
-    plot_side_by_side(results_currency, results_eevdf, outfile="model_output_fork_comparison.png")
+    plot_side_by_side(results_currency, results_eevdf, outfile="model_output_fork_comparison")
 
-    # Example bulk run: generate CSV summaries without looking at plots
-    suite_rows = run_suite(
-        experiment_fork,
-        [
-            ExperimentConfig(num_ticks=150, num_tasks=3, timeslice=1.0),
-            ExperimentConfig(num_ticks=200, num_tasks=4, timeslice=1.0),
-        ],
-        wakeup_grace=0.0,
-        label="fork_suite",
-    )
-    write_summary_csv(suite_rows, outfile="model_output_fork_suite.csv")
+    # suite_rows = run_suite(
+    #     experiment_fork,
+    #     [
+    #         ExperimentConfig(num_ticks=150, num_tasks=3, timeslice=1.0),
+    #         ExperimentConfig(num_ticks=200, num_tasks=4, timeslice=1.0),
+    #     ],
+    #     wakeup_grace=0.0,
+    #     label="fork_suite",
+    # )
+    # write_summary_csv(suite_rows, outfile="model_output_fork_suite.csv")
 
-    # Example random experiment; prints generated state changes and writes summaries
-    rand_cfg = ExperimentConfig(num_ticks=200, num_tasks=5, max_incoming=2, seed=100)
-    rand_cur, rand_eevdf = run_comparison(experiment_random, rand_cfg)
-    plot_side_by_side(rand_cur, rand_eevdf, outfile="model_output_random_comparison.png")
-    write_summary_csv(run_suite(experiment_random, [rand_cfg], label="random_123"), outfile="model_output_random_suite.csv")
+    # # Example random experiment; prints generated state changes and writes summaries
+    # rand_cfg = ExperimentConfig(num_ticks=200, num_tasks=5, max_incoming=2, seed=100)
+    # rand_cur, rand_eevdf = run_comparison(experiment_random, rand_cfg)
+    # plot_side_by_side(rand_cur, rand_eevdf, outfile="model_output_random_comparison")
+    # write_summary_csv(run_suite(experiment_random, [rand_cfg], label="random_123"), outfile="model_output_random_suite.csv")
 
 
 if __name__ == "__main__":
